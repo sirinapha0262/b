@@ -7,7 +7,7 @@ from tensorflow.keras.preprocessing import image
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='front/dist', static_url_path='')
 CORS(app)
 
 # โหลดโมเดลใหม่
@@ -256,15 +256,16 @@ def get_classes():
         'classes': classes_with_info
     })
 
+
+# Serve React frontend
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):
-    if path != "" and os.path.exists(app.static_folder + '/' + path):
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
         return send_from_directory(app.static_folder, path)
     else:
         return send_from_directory(app.static_folder, 'index.html')
 
 if __name__ == '__main__':
-    # ใช้ PORT จาก environment variable
     port = int(os.environ.get('PORT', 5000))
-    app.run(debug=False, threaded=True, host='0.0.0.0', port=port)
+    app.run(debug=False, host='0.0.0.0', port=port)
