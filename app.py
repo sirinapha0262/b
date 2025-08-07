@@ -8,7 +8,8 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 app = Flask(__name__, static_folder='front/dist', static_url_path='')
-CORS(app)
+CORS(app, origins=["https://creative-llama-52be6a.netlify.app"])
+
 
 # โหลดโมเดลใหม่
 model_path = "EyeModel_v3_best.h5"
