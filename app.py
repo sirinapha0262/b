@@ -1,70 +1,107 @@
 # app.py
+import numpy as np
 import os
 import json
-import numpy as np
-from io import BytesIO
-from PIL import Image
-from werkzeug.utils import secure_filename
+import gc
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing import image
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
+import logging
+from PIL import Image
+import io
 
-# ---------- Config ----------
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff', 'tif', 'webp'}
-IMG_SIZE = (128, 128)
-# กันไฟล์ใหญ่เกินจน proxy ตัด (ปรับได้ตามต้องการ)
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "10"))
+# ตั้งค่า logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ถ้าคุณโฮสต์ Front แยกที่ Netlify แล้ว ไม่จำเป็นต้อง serve static จาก Flask
-# ถ้ายังอยากคงไว้ ให้ตั้ง static_folder ตามโครงของคุณ
-app = Flask(__name__, static_folder='front/dist', static_url_path='')
-app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
+app = Flask(__name__)
 
-# ตั้ง CORS ให้ชัดเจน: origin ของ Netlify
-CORS(app,
-     resources={r"/*": {"origins": [
-         "https://creative-llama-52be6a.netlify.app"
-     ]}},
-     methods=["GET", "POST", "OPTIONS"],
-     allow_headers=["Content-Type", "Authorization"],
-     expose_headers=["Content-Type"])
+# ตั้งค่า CORS สำหรับ Netlify
+CORS(app, origins=[
+    "http://localhost:3000",
+    "http://localhost:5173", 
+    "https://*.netlify.app",
+    "https://creative-llama-52be6a.netlify.app"  # เปลี่ยนเป็น URL จริงของคุณ
+], supports_credentials=True)
 
-# ---------- Model Load (load once) ----------
-# ใช้ tf.keras เฉพาะตอนโหลด เพื่อลด import หนัก ๆ ตอน cold start
-import tensorflow as tf
-from tensorflow.keras.models import load_model
+# ตั้งค่าสำหรับ Proxy (สำหรับ Render)
+app.wsgi_app = ProxyFix(app.wsgi_app)
 
-model_path = "EyeModel_v3_best.h5"
-if not os.path.exists(model_path):
-    model_path = "EyeModel_v3_final.h5"
+# ตั้งค่า limits
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['UPLOAD_FOLDER'] = '/tmp'  # ใช้ /tmp บน Render
 
+# โหลดโมเดล (ให้โหลดครั้งเดียวตอนเริ่ม)
 model = None
-try:
-    model = load_model(model_path, compile=False)
-    print(f"[INIT] Model loaded: {model_path}")
-except Exception as e:
-    print(f"[INIT] Model load error: {e}")
+class_names = []
 
-# ---------- Class Names ----------
-try:
-    with open('class_names.json', 'r', encoding='utf-8') as f:
-        class_names = json.load(f)
-    print(f"[INIT] Class names loaded: {len(class_names)}")
-except FileNotFoundError:
-    class_names = [
-        'Central Serous Chorioretinopathy',
-        'Diabetic Retinopathy',
-        'Disc Edema',
-        'Glaucoma',
-        'Healthy',
-        'Macular Scar',
-        'Myopia',
-        'Pterygium',
-        'Retinal Detachment',
-        'Retinitis Pigmentosa'
-    ]
-    print("[INIT] Using fallback class names")
+def load_ai_model():
+    global model, class_names
+    try:
+        model_path = "EyeModel_v3_best.h5"
+        if not os.path.exists(model_path):
+            model_path = "EyeModel_v3_final.h5"
+        
+        logger.info(f"Loading model from {model_path}")
+        model = load_model(model_path, compile=False)
+        logger.info("Model loaded successfully")
+        
+        # โหลดรายชื่อคลาส
+        try:
+            with open('class_names.json', 'r', encoding='utf-8') as f:
+                class_names = json.load(f)
+            logger.info(f"Loaded {len(class_names)} class names")
+        except FileNotFoundError:
+            class_names = [
+                'Central Serous Chorioretinopathy',
+                'Diabetic Retinopathy', 
+                'Disc Edema',
+                'Glaucoma',
+                'Healthy',
+                'Macular Scar',
+                'Myopia',
+                'Pterygium',
+                'Retinal Detachment',
+                'Retinitis Pigmentosa'
+            ]
+            logger.info("Using fallback class names")
+            
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
+        model = None
 
-# ---------- Class Info ----------
+# โหลดโมเดลตอนเริ่มต้น
+load_ai_model()
+
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def validate_image(file_stream):
+    """ตรวจสอบและปรับขนาดรูป"""
+    try:
+        img = Image.open(file_stream)
+        
+        # ตรวจสอบขนาดไฟล์
+        if img.size[0] * img.size[1] > 4000 * 4000:  # ไม่เกิน 4000x4000
+            return None, "Image too large"
+            
+        # แปลงเป็น RGB ถ้าจำเป็น
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+            
+        # ปรับขนาดถ้าใหญ่เกินไป
+        if img.size[0] > 1024 or img.size[1] > 1024:
+            img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+            
+        return img, None
+    except Exception as e:
+        return None, f"Invalid image: {str(e)}"
+
+# ข้อมูลคลาสและคำแนะนำ
 class_info = {
     'Central Serous Chorioretinopathy': {
         'en': 'Central Serous Chorioretinopathy',
@@ -76,7 +113,7 @@ class_info = {
     },
     'Diabetic Retinopathy': {
         'en': 'Diabetic Retinopathy',
-        'th': 'จอตาเสื่อมจากเบาหวาน (Diabetic Retinopathy)',
+        'th': 'จอตาเสื่อมจากเบาหวาน (Diabetic Retinopathy)', 
         'description': {
             'en': 'Eye damage caused by diabetes complications. Requires immediate medical attention.',
             'th': 'ความเสียหายของตาจากภาวะแทรกซ้อนของเบาหวาน ต้องรีบพบแพทย์'
@@ -115,7 +152,7 @@ class_info = {
         }
     },
     'Myopia': {
-        'en': 'Myopia',
+        'en': 'Myopia', 
         'th': 'สายตาสั้น (Myopia)',
         'description': {
             'en': 'Nearsightedness - difficulty seeing distant objects clearly.',
@@ -148,128 +185,156 @@ class_info = {
     }
 }
 
-# ---------- Utils ----------
-def allowed_file(filename: str) -> bool:
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def preprocess_pil(img: Image.Image) -> np.ndarray:
-    img = img.convert('RGB').resize(IMG_SIZE)
-    x = np.asarray(img, dtype=np.float32) / 255.0
-    x = np.expand_dims(x, axis=0)
-    return x
-
-# ---------- Routes ----------
 @app.route('/health', methods=['GET'])
-def health():
+def health_check():
+    """Health check endpoint สำหรับ Render"""
     return jsonify({
         'status': 'healthy',
         'model_loaded': model is not None,
-        'total_classes': len(class_names),
-        'classes': class_names
+        'classes_count': len(class_names)
     })
 
-@app.route('/prewarm', methods=['POST', 'GET'])
-def prewarm():
-    """เรียก endpoint นี้หลัง deploy เพื่อวอร์มโมเดล/หลบ cold start"""
-    if model is None:
-        return jsonify({'ok': False, 'message': 'Model not loaded'}), 500
-    dummy = np.zeros((1, IMG_SIZE[0], IMG_SIZE[1], 3), dtype=np.float32)
-    _ = model.predict(dummy)
-    return jsonify({'ok': True, 'message': 'Model warmed'})
-
-@app.route('/classes', methods=['GET'])
-def get_classes():
-    classes_with_info = []
-    for class_name in class_names:
-        info = class_info.get(class_name, {
-            'en': class_name,
-            'th': class_name,
-            'description': {'en': 'No description available', 'th': 'ไม่มีข้อมูลอธิบาย'}
-        })
-        classes_with_info.append({
-            'name': {'en': info['en'], 'th': info['th']},
-            'description': info['description']
-        })
-    return jsonify({'status': 'success', 'total_classes': len(class_names), 'classes': classes_with_info})
-
-@app.route('/predict', methods=['POST'])
+@app.route('/predict', methods=['POST', 'OPTIONS'])
 def predict():
+    # Handle preflight request
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     if model is None:
-        return jsonify({'error': 'Model not loaded'}), 500
-
-    # รองรับทั้ง multipart/form-data และ direct binary
-    if 'image' in request.files:
-        file = request.files['image']
-        filename = secure_filename(file.filename or 'upload')
-        if not filename or not allowed_file(filename):
-            return jsonify({'error': 'Invalid file type. Supported: ' + ', '.join(sorted(ALLOWED_EXTENSIONS))}), 400
-        try:
-            img = Image.open(file.stream)
-        except Exception as e:
-            return jsonify({'error': f'Cannot read image: {e}'}), 400
-    else:
-        # เผื่อกรณี client ส่ง binary ตรง ๆ (เช่น fetch ส่ง Blob)
-        if not request.data:
-            return jsonify({'error': 'No image uploaded'}), 400
-        try:
-            img = Image.open(BytesIO(request.data))
-        except Exception as e:
-            return jsonify({'error': f'Cannot read image: {e}'}), 400
+        return jsonify({
+            'status': 'error',
+            'message': 'AI model not available. Please try again later.'
+        }), 503
+        
+    if 'image' not in request.files:
+        return jsonify({
+            'status': 'error',
+            'message': 'No image uploaded'
+        }), 400
+        
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({
+            'status': 'error',
+            'message': 'Empty filename'
+        }), 400
+        
+    if not allowed_file(file.filename):
+        return jsonify({
+            'status': 'error',
+            'message': 'Invalid file type. Supported: PNG, JPG, JPEG, GIF, BMP, TIFF'
+        }), 400
 
     try:
-        x = preprocess_pil(img)
-        preds = model.predict(x)[0]
-        pred_index = int(np.argmax(preds))
+        logger.info(f"Processing image: {file.filename}")
+        
+        # ตรวจสอบและปรับแต่งรูป
+        file_stream = io.BytesIO(file.read())
+        img_pil, error = validate_image(file_stream)
+        
+        if error:
+            return jsonify({
+                'status': 'error',
+                'message': error
+            }), 400
+        
+        # แปลงรูปสำหรับ model
+        img_array = np.array(img_pil.resize((128, 128)))
+        x = img_array.astype(np.float32) / 255.0
+        x = np.expand_dims(x, axis=0)
+        
+        logger.info("Running prediction...")
+        
+        # ทำนาย
+        preds = model.predict(x, verbose=0)[0]
+        pred_index = np.argmax(preds)
+        
+        # ดึงข้อมูลคลาสที่ทำนายได้
         predicted_class = class_names[pred_index]
         confidence = round(float(preds[pred_index]) * 100, 2)
-
-        # รายละเอียดทุกคลาส
+        
+        logger.info(f"Prediction: {predicted_class} ({confidence}%)")
+        
+        # สร้างรายละเอียดทุกคลาส
         details = []
         for i, prob in enumerate(preds):
             class_name = class_names[i]
-            info = class_info.get(class_name, {
-                'en': class_name, 'th': class_name,
-                'description': {'en': 'No description available', 'th': 'ไม่มีข้อมูลอธิบาย'}
+            class_data = class_info.get(class_name, {
+                'en': class_name,
+                'th': class_name,
+                'description': {
+                    'en': 'No description available', 
+                    'th': 'ไม่มีข้อมูลอธิบาย'
+                }
             })
+            
             details.append({
-                'class': {'en': info['en'], 'th': info['th']},
+                'class': {
+                    'en': class_data['en'],
+                    'th': class_data['th']
+                },
                 'probability': round(float(prob) * 100, 2)
             })
-        details.sort(key=lambda x: x['probability'], reverse=True)
-
+        
+        # เรียงลำดับจากมากไปน้อย
+        details = sorted(details, key=lambda x: x['probability'], reverse=True)
+        
+        # ข้อมูลคลาสที่ทำนายได้
         predicted_info = class_info.get(predicted_class, {
-            'en': predicted_class, 'th': predicted_class,
-            'description': {'en': 'No description available', 'th': 'ไม่มีข้อมูลอธิบาย'}
+            'en': predicted_class,
+            'th': predicted_class,
+            'description': {
+                'en': 'No description available', 
+                'th': 'ไม่มีข้อมูลอธิบาย'
+            }
         })
-
+        
+        # ทำความสะอาด memory
+        del x, preds, img_array, img_pil
+        gc.collect()
+        
         return jsonify({
             'status': 'success',
-            'prediction': {'en': predicted_info['en'], 'th': predicted_info['th']},
+            'prediction': {
+                'en': predicted_info['en'],
+                'th': predicted_info['th']
+            },
             'confidence': confidence,
             'details': details,
             'recommendation': predicted_info['description'],
             'total_classes': len(class_names)
         })
+        
     except Exception as e:
-        return jsonify({'status': 'error', 'message': f'Error processing image: {str(e)}'}), 500
+        logger.error(f"Error processing image: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': 'Error processing image. Please try again with a different image.'
+        }), 500
 
-# ---------- Error Handlers ----------
 @app.errorhandler(413)
 def too_large(e):
-    return jsonify({'status': 'error', 'message': f'File too large. Max {MAX_UPLOAD_MB}MB'}), 413
+    return jsonify({
+        'status': 'error',
+        'message': 'File too large. Maximum size is 16MB.'
+    }), 413
 
-# ---------- (Optional) Serve React build if needed ----------
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({
+        'status': 'error',
+        'message': 'Internal server error. Please try again later.'
+    }), 500
+
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):
-    # ถ้าคุณโฮสต์ Front ที่ Netlify อยู่แล้ว เส้นทางนี้แทบไม่ได้ใช้
-    if path and os.path.exists(os.path.join(app.static_folder, path)):
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
         return send_from_directory(app.static_folder, path)
-    index_path = os.path.join(app.static_folder, 'index.html')
-    if os.path.exists(index_path):
+    else:
         return send_from_directory(app.static_folder, 'index.html')
-    return jsonify({'ok': True, 'message': 'API service'}), 200
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', '5000'))
-    app.run(debug=False, host='0.0.0.0', port=port)
+    port = int(os.environ.get('PORT', 5000))
+    logger.info(f"Starting app on port {port}")
+    app.run(debug=False, threaded=True, host='0.0.0.0', port=port)
