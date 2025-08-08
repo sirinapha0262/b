@@ -1,35 +1,55 @@
 # app.py
-import numpy as np
 import os
 import json
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing import image
+import numpy as np
+from io import BytesIO
+from PIL import Image
+from werkzeug.utils import secure_filename
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
+# ---------- Config ----------
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff', 'tif', 'webp'}
+IMG_SIZE = (128, 128)
+# กันไฟล์ใหญ่เกินจน proxy ตัด (ปรับได้ตามต้องการ)
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "10"))
+
+# ถ้าคุณโฮสต์ Front แยกที่ Netlify แล้ว ไม่จำเป็นต้อง serve static จาก Flask
+# ถ้ายังอยากคงไว้ ให้ตั้ง static_folder ตามโครงของคุณ
 app = Flask(__name__, static_folder='front/dist', static_url_path='')
-CORS(app, origins=["https://creative-llama-52be6a.netlify.app"])
+app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
 
+# ตั้ง CORS ให้ชัดเจน: origin ของ Netlify
+CORS(app,
+     resources={r"/*": {"origins": [
+         "https://creative-llama-52be6a.netlify.app"
+     ]}},
+     methods=["GET", "POST", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization"],
+     expose_headers=["Content-Type"])
 
-# โหลดโมเดลใหม่
+# ---------- Model Load (load once) ----------
+# ใช้ tf.keras เฉพาะตอนโหลด เพื่อลด import หนัก ๆ ตอน cold start
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+
 model_path = "EyeModel_v3_best.h5"
 if not os.path.exists(model_path):
     model_path = "EyeModel_v3_final.h5"
 
+model = None
 try:
     model = load_model(model_path, compile=False)
-    print(f"Model loaded successfully from {model_path}")
+    print(f"[INIT] Model loaded: {model_path}")
 except Exception as e:
-    print(f"Error loading model: {e}")
-    model = None
+    print(f"[INIT] Model load error: {e}")
 
-# โหลดรายชื่อคลาส
+# ---------- Class Names ----------
 try:
-    with open('class_names.json', 'r') as f:
+    with open('class_names.json', 'r', encoding='utf-8') as f:
         class_names = json.load(f)
-    print(f"Loaded {len(class_names)} class names: {class_names}")
+    print(f"[INIT] Class names loaded: {len(class_names)}")
 except FileNotFoundError:
-    # Fallback: ใช้ชื่อคลาสเริ่มต้นตามที่เห็นในรูป
     class_names = [
         'Central Serous Chorioretinopathy',
         'Diabetic Retinopathy',
@@ -42,14 +62,9 @@ except FileNotFoundError:
         'Retinal Detachment',
         'Retinitis Pigmentosa'
     ]
-    print("Using fallback class names")
+    print("[INIT] Using fallback class names")
 
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff'}
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-# ข้อมูลคลาสและคำแนะนำ (ภาษาไทยและอังกฤษ)
+# ---------- Class Info ----------
 class_info = {
     'Central Serous Chorioretinopathy': {
         'en': 'Central Serous Chorioretinopathy',
@@ -133,99 +148,19 @@ class_info = {
     }
 }
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    if model is None:
-        return jsonify({'error': 'Model not loaded'}), 500
-        
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image uploaded'}), 400
-        
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'Empty filename'}), 400
-    if not allowed_file(file.filename):
-        return jsonify({'error': 'Invalid file type. Supported: PNG, JPG, JPEG, GIF, BMP, TIFF'}), 400
+# ---------- Utils ----------
+def allowed_file(filename: str) -> bool:
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-    try:
-        # สร้างโฟลเดอร์ uploads ถ้ายังไม่มี
-        basepath = os.path.dirname(__file__)
-        upload_dir = os.path.join(basepath, 'uploads')
-        os.makedirs(upload_dir, exist_ok=True)
-        
-        # บันทึกไฟล์
-        filepath = os.path.join(upload_dir, file.filename)
-        file.save(filepath)
-        
-        # โหลดและประมวลผลภาพ
-        img = image.load_img(filepath, target_size=(128, 128))
-        x = image.img_to_array(img)
-        x = x / 255.0  # normalize เหมือนตอน training
-        x = np.expand_dims(x, axis=0)
-        
-        # ทำนาย
-        preds = model.predict(x)[0]
-        pred_index = np.argmax(preds)
-        
-        # ดึงข้อมูลคลาสที่ทำนายได้
-        predicted_class = class_names[pred_index]
-        confidence = round(float(preds[pred_index]) * 100, 2)
-        
-        # สร้างรายละเอียดทุกคลาส
-        details = []
-        for i, prob in enumerate(preds):
-            class_name = class_names[i]
-            class_data = class_info.get(class_name, {
-                'en': class_name,
-                'th': class_name,
-                'description': {'en': 'No description available', 'th': 'ไม่มีข้อมูลอธิบาย'}
-            })
-            
-            details.append({
-                'class': {
-                    'en': class_data['en'],
-                    'th': class_data['th']
-                },
-                'probability': round(float(prob) * 100, 2)
-            })
-        
-        # เรียงลำดับจากมากไปน้อย
-        details = sorted(details, key=lambda x: x['probability'], reverse=True)
-        
-        # ข้อมูลคลาสที่ทำนายได้
-        predicted_info = class_info.get(predicted_class, {
-            'en': predicted_class,
-            'th': predicted_class,
-            'description': {'en': 'No description available', 'th': 'ไม่มีข้อมูลอธิบาย'}
-        })
-        
-        # ลบไฟล์ที่อัปโหลดหลังจากประมวลผลเสร็จ
-        try:
-            os.remove(filepath)
-        except:
-            pass
-        
-        return jsonify({
-            'status': 'success',
-            'prediction': {
-                'en': predicted_info['en'],
-                'th': predicted_info['th']
-            },
-            'confidence': confidence,
-            'details': details,
-            'recommendation': predicted_info['description'],
-            'total_classes': len(class_names)
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'status': 'error', 
-            'message': f'Error processing image: {str(e)}'
-        }), 500
+def preprocess_pil(img: Image.Image) -> np.ndarray:
+    img = img.convert('RGB').resize(IMG_SIZE)
+    x = np.asarray(img, dtype=np.float32) / 255.0
+    x = np.expand_dims(x, axis=0)
+    return x
 
+# ---------- Routes ----------
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
         'model_loaded': model is not None,
@@ -233,9 +168,17 @@ def health():
         'classes': class_names
     })
 
+@app.route('/prewarm', methods=['POST', 'GET'])
+def prewarm():
+    """เรียก endpoint นี้หลัง deploy เพื่อวอร์มโมเดล/หลบ cold start"""
+    if model is None:
+        return jsonify({'ok': False, 'message': 'Model not loaded'}), 500
+    dummy = np.zeros((1, IMG_SIZE[0], IMG_SIZE[1], 3), dtype=np.float32)
+    _ = model.predict(dummy)
+    return jsonify({'ok': True, 'message': 'Model warmed'})
+
 @app.route('/classes', methods=['GET'])
 def get_classes():
-    """Get all available classes"""
     classes_with_info = []
     for class_name in class_names:
         info = class_info.get(class_name, {
@@ -244,29 +187,89 @@ def get_classes():
             'description': {'en': 'No description available', 'th': 'ไม่มีข้อมูลอธิบาย'}
         })
         classes_with_info.append({
-            'name': {
-                'en': info['en'],
-                'th': info['th']
-            },
+            'name': {'en': info['en'], 'th': info['th']},
             'description': info['description']
         })
-    
-    return jsonify({
-        'status': 'success',
-        'total_classes': len(class_names),
-        'classes': classes_with_info
-    })
+    return jsonify({'status': 'success', 'total_classes': len(class_names), 'classes': classes_with_info})
 
+@app.route('/predict', methods=['POST'])
+def predict():
+    if model is None:
+        return jsonify({'error': 'Model not loaded'}), 500
 
-# Serve React frontend
+    # รองรับทั้ง multipart/form-data และ direct binary
+    if 'image' in request.files:
+        file = request.files['image']
+        filename = secure_filename(file.filename or 'upload')
+        if not filename or not allowed_file(filename):
+            return jsonify({'error': 'Invalid file type. Supported: ' + ', '.join(sorted(ALLOWED_EXTENSIONS))}), 400
+        try:
+            img = Image.open(file.stream)
+        except Exception as e:
+            return jsonify({'error': f'Cannot read image: {e}'}), 400
+    else:
+        # เผื่อกรณี client ส่ง binary ตรง ๆ (เช่น fetch ส่ง Blob)
+        if not request.data:
+            return jsonify({'error': 'No image uploaded'}), 400
+        try:
+            img = Image.open(BytesIO(request.data))
+        except Exception as e:
+            return jsonify({'error': f'Cannot read image: {e}'}), 400
+
+    try:
+        x = preprocess_pil(img)
+        preds = model.predict(x)[0]
+        pred_index = int(np.argmax(preds))
+        predicted_class = class_names[pred_index]
+        confidence = round(float(preds[pred_index]) * 100, 2)
+
+        # รายละเอียดทุกคลาส
+        details = []
+        for i, prob in enumerate(preds):
+            class_name = class_names[i]
+            info = class_info.get(class_name, {
+                'en': class_name, 'th': class_name,
+                'description': {'en': 'No description available', 'th': 'ไม่มีข้อมูลอธิบาย'}
+            })
+            details.append({
+                'class': {'en': info['en'], 'th': info['th']},
+                'probability': round(float(prob) * 100, 2)
+            })
+        details.sort(key=lambda x: x['probability'], reverse=True)
+
+        predicted_info = class_info.get(predicted_class, {
+            'en': predicted_class, 'th': predicted_class,
+            'description': {'en': 'No description available', 'th': 'ไม่มีข้อมูลอธิบาย'}
+        })
+
+        return jsonify({
+            'status': 'success',
+            'prediction': {'en': predicted_info['en'], 'th': predicted_info['th']},
+            'confidence': confidence,
+            'details': details,
+            'recommendation': predicted_info['description'],
+            'total_classes': len(class_names)
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': f'Error processing image: {str(e)}'}), 500
+
+# ---------- Error Handlers ----------
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({'status': 'error', 'message': f'File too large. Max {MAX_UPLOAD_MB}MB'}), 413
+
+# ---------- (Optional) Serve React build if needed ----------
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):
-    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+    # ถ้าคุณโฮสต์ Front ที่ Netlify อยู่แล้ว เส้นทางนี้แทบไม่ได้ใช้
+    if path and os.path.exists(os.path.join(app.static_folder, path)):
         return send_from_directory(app.static_folder, path)
-    else:
+    index_path = os.path.join(app.static_folder, 'index.html')
+    if os.path.exists(index_path):
         return send_from_directory(app.static_folder, 'index.html')
+    return jsonify({'ok': True, 'message': 'API service'}), 200
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', '5000'))
     app.run(debug=False, host='0.0.0.0', port=port)
